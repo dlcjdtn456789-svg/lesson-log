@@ -1101,20 +1101,25 @@ function EntryForm({ editing, setEditing, onSave, onCancel, onImage, onDrawing, 
 }
 
 /* ================= Drawing canvas ================= */
-const PAD_H = 460;
-const FULL_H = 1800; // tall writing surface in fullscreen (panned via transform)
+// Fixed logical writing surface. The backing store is created ONCE and never
+// resized, so nothing is ever cropped when toggling fullscreen. On screen the
+// canvas is CSS-scaled to the container width (aspect kept via aspect-ratio),
+// and pointer coords are mapped rect -> logical, so pen and ink always align.
+const LOGICAL_W = 1000;
+const LOGICAL_H = 2000;
+const PAD_H = 460;       // inline viewport height
 const NOSEL = { WebkitUserSelect: "none", userSelect: "none", WebkitTouchCallout: "none" };
 
 function DrawPad({ onRead, parsing }) {
   const cvs = useRef(null);
-  const wrapRef = useRef(null);      // fullscreen clip container
+  const wrapRef = useRef(null);      // clip/pan container (both modes)
   const drawing = useRef(false);
   const toolRef = useRef("pen");
   const dirtyRef = useRef(false);
-  const dimsRef = useRef(null);      // last rendered {w,h} for content-preserving resize
+  const maxYRef = useRef(0);         // lowest logical y drawn (for cropped export)
   const panning = useRef(false);
   const lastPanY = useRef(null);
-  const offsetRef = useRef(0);       // current pan offset (px)
+  const offsetRef = useRef(0);       // current pan offset (display px)
   const [offset, setOffset] = useState(0);
   const [dirty, setDirty] = useState(false);
   const [tool, setTool] = useState("pen"); // pen | eraser
@@ -1128,55 +1133,54 @@ function DrawPad({ onRead, parsing }) {
   const setupCtx = () => {
     const ctx = cvs.current.getContext("2d");
     ctx.lineCap = "round"; ctx.lineJoin = "round";
-    if (toolRef.current === "eraser") { ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 28; }
-    else { ctx.strokeStyle = "#1e293b"; ctx.lineWidth = 2.8; }
+    // widths are in logical units (surface is 1000 wide)
+    if (toolRef.current === "eraser") { ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 36; }
+    else { ctx.strokeStyle = "#1e293b"; ctx.lineWidth = 3.2; }
   };
 
+  // client coords -> logical canvas coords (correct under any CSS scale/transform)
   const pos = (e) => {
     const r = cvs.current.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
+    return {
+      x: (e.clientX - r.left) * (LOGICAL_W / r.width),
+      y: (e.clientY - r.top) * (LOGICAL_H / r.height),
+    };
   };
 
   // finger touches only (ignore Apple Pencil so palm/pen don't trigger pan)
   const fingers = (e) => [...e.touches].filter(t => t.touchType !== "stylus");
   const avgY = (list) => list.reduce((a, t) => a + t.clientY, 0) / list.length;
 
-  // resize backing store to element size, preserving drawing at a consistent width scale
-  const fit = () => {
-    const c = cvs.current; if (!c) return;
-    const ratio = window.devicePixelRatio || 1;
-    const newW = c.clientWidth, newH = c.clientHeight;
-    if (!newW || !newH) return;
-    const old = dimsRef.current;
-    const snap = dirtyRef.current && old ? c.toDataURL("image/png") : null;
-    c.width = Math.round(newW * ratio); c.height = Math.round(newH * ratio);
-    const ctx = c.getContext("2d");
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, newW, newH);
-    if (snap) {
-      const img = new Image();
-      img.onload = () => { const s = newW / old.w; ctx.drawImage(img, 0, 0, old.w * s, old.h * s); };
-      img.src = snap;
-    }
-    dimsRef.current = { w: newW, h: newH };
-  };
-
   useEffect(() => {
     const c = cvs.current;
-    fit();
+    // one-time backing store init — never recreated afterwards
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    c.width = LOGICAL_W * dpr; c.height = LOGICAL_H * dpr;
+    const ictx = c.getContext("2d");
+    ictx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ictx.fillStyle = "#ffffff"; ictx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
     const down = (e) => {
       if (e.pointerType === "touch" && panning.current) return;
       e.preventDefault(); drawing.current = true;
       try { c.setPointerCapture(e.pointerId); } catch {}
       setupCtx();
       const ctx = c.getContext("2d"); const p = pos(e);
+      maxYRef.current = Math.max(maxYRef.current, p.y);
       ctx.beginPath(); ctx.moveTo(p.x, p.y);
     };
     const move = (e) => {
       if (!drawing.current || panning.current) return;
       e.preventDefault();
-      const ctx = c.getContext("2d"); const p = pos(e);
-      ctx.lineTo(p.x, p.y); ctx.stroke(); markDirty();
+      const ctx = c.getContext("2d");
+      // coalesced events = every intermediate pencil sample -> smoother, truer strokes
+      const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+      for (const ev of (evs.length ? evs : [e])) {
+        const p = pos(ev);
+        maxYRef.current = Math.max(maxYRef.current, p.y);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke(); markDirty();
     };
     const up = (e) => {
       drawing.current = false;
@@ -1221,8 +1225,6 @@ function DrawPad({ onRead, parsing }) {
     c.addEventListener("touchend", tEnd);
     c.addEventListener("touchcancel", tEnd);
 
-    const onResize = () => requestAnimationFrame(fit);
-    window.addEventListener("resize", onResize);
     return () => {
       c.removeEventListener("pointerdown", down);
       c.removeEventListener("pointermove", move);
@@ -1233,25 +1235,35 @@ function DrawPad({ onRead, parsing }) {
       c.removeEventListener("touchmove", tMove);
       c.removeEventListener("touchend", tEnd);
       c.removeEventListener("touchcancel", tEnd);
-      window.removeEventListener("resize", onResize);
     };
   }, []);
 
-  // re-fit when entering/leaving fullscreen (after layout settles)
+  // entering/leaving fullscreen: lock page scroll, reset pan.
+  // The canvas itself is untouched — content is fully preserved.
   useEffect(() => {
-    const id = requestAnimationFrame(() => requestAnimationFrame(fit));
     document.body.style.overflow = full ? "hidden" : "";
     offsetRef.current = 0; setOffset(0);
-    return () => { cancelAnimationFrame(id); document.body.style.overflow = ""; };
+    return () => { document.body.style.overflow = ""; };
   }, [full]);
 
   const clearAll = () => {
-    const c = cvs.current, ctx = c.getContext("2d");
-    const ratio = window.devicePixelRatio || 1;
-    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, c.width / ratio, c.height / ratio);
-    dirtyRef.current = false; setDirty(false);
+    const ctx = cvs.current.getContext("2d");
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    dirtyRef.current = false; setDirty(false); maxYRef.current = 0;
   };
-  const read = () => onRead(cvs.current.toDataURL("image/png").split(",")[1]);
+
+  // export cropped to the written area (blank bottom trimmed -> better AI reading)
+  const read = () => {
+    const c = cvs.current;
+    const scale = c.width / LOGICAL_W; // backing px per logical px
+    const cropH = Math.round(Math.min(LOGICAL_H, Math.max(400, maxYRef.current + 60)) * scale);
+    const t = document.createElement("canvas");
+    t.width = c.width; t.height = cropH;
+    const tc = t.getContext("2d");
+    tc.fillStyle = "#ffffff"; tc.fillRect(0, 0, t.width, t.height);
+    tc.drawImage(c, 0, 0, c.width, cropH, 0, 0, t.width, cropH);
+    onRead(t.toDataURL("image/png").split(",")[1]);
+  };
 
   const toolBtn = (t, icon, label) => (
     <button onClick={() => setTool(t)} draggable={false} style={NOSEL}
@@ -1264,7 +1276,7 @@ function DrawPad({ onRead, parsing }) {
   return (
     <div onContextMenu={e => e.preventDefault()} style={NOSEL}
       className={full ? "fixed inset-0 z-50 bg-white flex flex-col p-3 gap-2" : ""}>
-      {!full && <div className="text-xs text-slate-500 mb-2">아래 칸에 손가락이나 애플펜슬로 쓰세요. 레슨 중엔 "전체화면"으로 크게 쓰는 걸 권합니다.</div>}
+      {!full && <div className="text-xs text-slate-500 mb-2">아래 칸에 손가락이나 애플펜슬로 쓰세요. 두 손가락으로 위아래 스크롤. 레슨 중엔 "전체화면"으로 크게 쓰는 걸 권합니다.</div>}
       <div className="flex gap-2 items-center flex-wrap">
         {toolBtn("pen", <PenLine size={14} />, "펜")}
         {toolBtn("eraser", <Eraser size={14} />, "지우개")}
@@ -1278,11 +1290,14 @@ function DrawPad({ onRead, parsing }) {
         </button>
       </div>
 
-      <div ref={wrapRef} className={full ? "flex-1 min-h-0 overflow-hidden relative rounded-xl border-2 border-amber-200" : ""}>
+      <div ref={wrapRef}
+        className={"overflow-hidden relative rounded-xl border-2 border-amber-200 " + (full ? "flex-1 min-h-0" : "")}
+        style={full ? undefined : { height: PAD_H }}>
         <canvas ref={cvs}
-          className={"w-full block bg-white " + (full ? "absolute top-0 left-0" : "rounded-xl border-2 border-amber-200")}
-          style={{ height: full ? FULL_H : PAD_H, touchAction: "none", ...NOSEL,
-            transform: full ? `translateY(${-offset}px)` : "none",
+          className="w-full block bg-white absolute top-0 left-0"
+          style={{ height: "auto", aspectRatio: `${LOGICAL_W} / ${LOGICAL_H}`,
+            touchAction: "none", ...NOSEL,
+            transform: `translateY(${-offset}px)`,
             cursor: tool === "eraser" ? "cell" : "crosshair" }} />
       </div>
 
