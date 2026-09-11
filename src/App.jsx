@@ -8,8 +8,7 @@ import {
   LayoutDashboard, List, Users, PlusCircle, Upload, Loader2, Download,
   Trash2, Pencil, ChevronLeft, Music4, Save, FileText, PenLine,
   Eraser, RotateCcw, Sparkles, Maximize2, Minimize2,
-  Settings, KeyRound, ExternalLink, GraduationCap, CheckCircle2, Circle,
-  Copy, RefreshCw, Target, Flag, CalendarRange,
+  Settings, KeyRound, ExternalLink,
 } from "lucide-react";
 
 const SKILL_KEYS = ["리듬", "테크닉", "독보", "표현", "완성도"];
@@ -81,73 +80,28 @@ function getModel() {
   try { return localStorage.getItem(API_MODEL_STORAGE) || DEFAULT_MODEL; } catch { return DEFAULT_MODEL; }
 }
 
-const API_URL = "https://api.anthropic.com/v1/messages";
-const apiHeaders = (key) => ({
-  "content-type": "application/json",
-  "x-api-key": key,
-  "anthropic-version": "2023-06-01",
-  "anthropic-dangerous-direct-browser-access": "true",
-});
-
-function requireKey() {
+async function callAnthropic(messages, maxTokens) {
   const key = getApiKey();
   if (!key) {
     const e = new Error("NO_API_KEY");
     e.code = "NO_API_KEY";
     throw e;
   }
-  return key;
-}
-
-async function apiError(resp) {
-  const t = await resp.text();
-  const e = new Error("API " + resp.status + ": " + t.slice(0, 300));
-  e.status = resp.status;
-  return e;
-}
-
-async function callAnthropic(messages, maxTokens) {
-  const resp = await fetch(API_URL, {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: apiHeaders(requireKey()),
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
     body: JSON.stringify({ model: getModel(), max_tokens: maxTokens, messages }),
   });
-  if (!resp.ok) throw await apiError(resp);
-  return resp.json();
-}
-
-// Streaming variant for long generations: keeps the connection active on slow
-// mobile networks and reports progress. Resolves to the concatenated text.
-async function streamAnthropic(messages, maxTokens, extra, onChars) {
-  const resp = await fetch(API_URL, {
-    method: "POST",
-    headers: apiHeaders(requireKey()),
-    body: JSON.stringify({ model: getModel(), max_tokens: maxTokens, messages, stream: true, ...extra }),
-  });
-  if (!resp.ok) throw await apiError(resp);
-  const reader = resp.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "", text = "", stopReason = null;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true }).replace(/\r/g, "");
-    let cut;
-    while ((cut = buf.indexOf("\n\n")) >= 0) {
-      const block = buf.slice(0, cut); buf = buf.slice(cut + 2);
-      const data = block.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("");
-      if (!data) continue;
-      let ev; try { ev = JSON.parse(data); } catch { continue; }
-      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-        text += ev.delta.text; onChars?.(text.length);
-      } else if (ev.type === "message_delta" && ev.delta?.stop_reason) {
-        stopReason = ev.delta.stop_reason;
-      } else if (ev.type === "error") {
-        throw new Error("API stream: " + (ev.error?.message || "error"));
-      }
-    }
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error("API " + resp.status + ": " + t.slice(0, 300));
   }
-  return { text, stopReason };
+  return resp.json();
 }
 
 // src is either a File, or { base64, mediaType } (from the drawing canvas)
@@ -190,197 +144,6 @@ async function parseImage(src) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-/* ---------- curriculum (AI-generated, stored locally) ---------- */
-const CURR_STORAGE = "lesson_curriculum_v1";
-const COURSE_KEY = "__course__";
-const studentKey = (s) => `${s.academy}||${s.student}`;
-
-function loadCurricula() {
-  try {
-    const o = JSON.parse(localStorage.getItem(CURR_STORAGE) || "{}");
-    return o && typeof o === "object" && !Array.isArray(o) ? o : {};
-  } catch { return {}; }
-}
-function saveCurricula(obj) {
-  try { localStorage.setItem(CURR_STORAGE, JSON.stringify(obj)); return true; } catch { return false; }
-}
-
-const ym = (d) => d.slice(0, 7);
-const addMonths = (month, n) => {
-  const [y, m] = month.split("-").map(Number);
-  const d = new Date(y, m - 1 + n, 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-};
-// plan starts the month after the latest record, but never before the current month
-const planStart = (lastMonth) => {
-  const next = addMonths(lastMonth, 1), now = new Date().toISOString().slice(0, 7);
-  return next < now ? now : next;
-};
-const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.round(Number(v) || lo)));
-
-// group lesson entries by YYYY-MM with per-month stats (deterministic, no AI)
-function monthlyFlow(entries) {
-  const m = {};
-  entries.forEach(e => { (m[ym(e.date)] ||= []).push(e); });
-  return Object.keys(m).sort().map(month => {
-    const es = [...m[month]].sort((a, b) => a.date.localeCompare(b.date));
-    const bpms = es.map(e => Number(e.bpm)).filter(Boolean);
-    const avg = {};
-    SKILL_KEYS.forEach(k => {
-      const v = es.map(e => e.skills?.[k]).filter(x => x != null);
-      avg[k] = v.length ? +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1) : null;
-    });
-    const levels = {};
-    es.forEach(e => { if (e.level) levels[e.level] = (levels[e.level] || 0) + 1; });
-    return {
-      month, entries: es, count: es.length,
-      students: new Set(es.map(e => `${e.academy}||${e.student}`)).size,
-      level: es[es.length - 1].level, levels, avg,
-      bpmMin: bpms.length ? Math.min(...bpms) : null,
-      bpmMax: bpms.length ? Math.max(...bpms) : null,
-    };
-  });
-}
-
-const lessonLine = (e, withName) =>
-  `- ${e.date.slice(5)}${withName ? " " + e.student : ""} [${e.level || "-"}${e.bpm ? " ♩" + e.bpm : ""}] ` +
-  SKILL_KEYS.map(k => `${k}${e.skills?.[k] ?? "-"}`).join(" ") +
-  ` | 내용: ${e.content || "-"}` + (e.homework ? ` | 과제: ${e.homework}` : "") + (e.memo ? ` | 메모: ${e.memo}` : "");
-
-const JS_STR = { type: "string" };
-const JS_STRS = { type: "array", items: JS_STR };
-const jsObj = (props) => ({ type: "object", additionalProperties: false, required: Object.keys(props), properties: props });
-const UNIT_SCHEMA = jsObj({ title: JS_STR, detail: JS_STR, bpmTarget: JS_STR, homework: JS_STR });
-const STUDENT_CURR_SCHEMA = jsObj({
-  overview: JS_STR,
-  currentStage: JS_STR,
-  completed: { type: "array", items: jsObj({ month: JS_STR, theme: JS_STR, topics: JS_STRS, achievement: JS_STR }) },
-  focus: JS_STRS,
-  plan: { type: "array", items: jsObj({ month: JS_STR, goal: JS_STR, units: { type: "array", items: UNIT_SCHEMA } }) },
-  milestones: JS_STRS,
-});
-const COURSE_SCHEMA = jsObj({
-  overview: JS_STR,
-  levels: { type: "array", items: jsObj({
-    level: { type: "string", enum: LEVELS },
-    summary: JS_STR, entry: JS_STR, exit: JS_STR,
-    months: { type: "array", items: jsObj({ title: JS_STR, goal: JS_STR, units: { type: "array", items: UNIT_SCHEMA } }) },
-  }) },
-});
-
-// JSON-schema constrained generation; retries as plain JSON text for models
-// that reject structured outputs (400).
-async function callJSON(prompt, schema, onChars) {
-  const messages = [{ role: "user", content: prompt }];
-  let res;
-  try {
-    res = await streamAnthropic(messages, 32000, { output_config: { format: { type: "json_schema", schema } } }, onChars);
-  } catch (e) {
-    if (e.status !== 400) throw e;
-    res = await streamAnthropic(messages, 32000, {}, onChars);
-  }
-  const fail = (code) => { const e = new Error(code); e.code = code; return e; };
-  if (res.stopReason === "refusal") throw fail("REFUSAL");
-  if (res.stopReason === "max_tokens") throw fail("TRUNCATED");
-  const a = res.text.indexOf("{"), b = res.text.lastIndexOf("}");
-  return JSON.parse(a >= 0 && b > a ? res.text.slice(a, b + 1) : res.text);
-}
-
-const asArr = (v) => (Array.isArray(v) ? v : []);
-const asStr = (v) => (typeof v === "string" ? v : v == null ? "" : String(v));
-const normUnit = (u) => ({
-  id: crypto.randomUUID(), title: asStr(u?.title), detail: asStr(u?.detail),
-  bpmTarget: asStr(u?.bpmTarget), homework: asStr(u?.homework), done: false,
-});
-
-const aiErrorText = (e) =>
-  e?.code === "NO_API_KEY" ? "커리큘럼을 만들려면 먼저 오른쪽 위 '설정'에서 Anthropic API 키를 입력하세요."
-  : e?.code === "TRUNCATED" ? "내용이 길어 응답이 잘렸습니다. 기간이나 월 레슨 횟수를 줄여서 다시 시도하세요."
-  : e?.code === "REFUSAL" ? "AI가 이 요청을 처리하지 못했습니다. 기록 내용을 확인한 뒤 다시 시도하세요."
-  : "커리큘럼을 생성하지 못했습니다. API 키와 네트워크를 확인한 뒤 다시 시도하세요.";
-
-function buildStudentPrompt(s, flow, opts, prev) {
-  const months = Array.from({ length: opts.horizon }, (_, i) => addMonths(opts.start, i));
-  const records = flow.map(f =>
-    `## ${f.month} (${f.count}회)\n` + f.entries.map(e => lessonLine(e, false)).join("\n")).join("\n\n");
-  let prevText = "";
-  if (prev?.plan?.length) {
-    const done = prev.plan.flatMap(p => p.units.filter(u => u.done).map(u => u.title));
-    const todo = prev.plan.flatMap(p => p.units.filter(u => !u.done).map(u => u.title));
-    prevText = `\n\n[이전 커리큘럼 진행 상황]\n완료: ${done.join(", ") || "없음"}\n미완료: ${todo.join(", ") || "없음"}\n` +
-      "완료한 단원은 반복하지 말고, 미완료 단원 중 여전히 필요한 것은 새 계획에 이어서 넣으세요.";
-  }
-  return `당신은 경력 많은 드럼 강사입니다. 아래는 학생 한 명의 레슨 기록을 월별로 모은 것입니다(실력 지표는 1~5점).
-
-학생: ${s.student} (${s.academy || "학원 미정"}), 현재 레벨: ${s.level}, 총 ${s.count}회
-
-${records}${prevText}
-
-이 기록을 토대로 이 학생의 커리큘럼을 만들어 주세요.
-- overview: 지금까지의 학습 흐름과 앞으로의 방향을 2~3문장으로.
-- currentStage: 현재 도달한 단계를 한 문장으로 진단(템포·레벨·강점 근거 포함).
-- completed: 기록된 각 달(${flow.map(f => f.month).join(", ")})마다 하나씩, 그 달에 다룬 내용을 한 단원으로 묶어 theme(단원명), topics(다룬 루디먼트·그루브·곡 등 핵심 항목), achievement(그 달의 성취). 기록에 없는 내용은 지어내지 마세요.
-- focus: 메모와 실력 지표에서 드러난 보완할 점 2~4개.
-- plan: 정확히 ${opts.horizon}개월이며 month는 순서대로 ${months.join(", ")}. 각 달에 goal(그 달 목표)과 units를 정확히 ${opts.perMonth}개(월 레슨 횟수) 작성. 각 unit은 title(회차 주제), detail(레슨에서 할 구체적 연습: 루디먼트·그루브·필인·곡 구간 등), bpmTarget(예: "♩=110", 해당 없으면 빈 문자열), homework(다음 레슨까지 과제). 최근 기록의 과제와 템포에서 자연스럽게 이어지고 달마다 난이도가 점진적으로 오르게 하세요.
-- milestones: 계획 기간이 끝났을 때 확인할 수 있는 구체적 도달 목표 3~5개.
-모든 문장은 자연스러운 한국어로, 마크다운 기호 없이 쓰세요. JSON 객체 하나로만 답하세요.`;
-}
-
-function buildCoursePrompt(flow, opts) {
-  const records = flow.map(f =>
-    `## ${f.month} (${f.count}회, 학생 ${f.students}명)\n` + f.entries.map(e => lessonLine(e, true)).join("\n")).join("\n\n");
-  return `당신은 드럼 교육 과정을 설계하는 베테랑 강사입니다. 아래는 한 강사가 여러 학생에게 진행한 레슨 기록을 월별로 모은 것입니다(실력 지표는 1~5점).
-
-${records}
-
-이 기록에서 실제로 가르친 내용과 학생들이 성장해 온 순서를 분석해서, 이 강사가 앞으로 새 학생에게 그대로 쓸 수 있는 레벨별 표준 커리큘럼으로 체계화해 주세요.
-- overview: 기록에서 드러난 지도 방식과 과정 설계 원칙을 2~3문장으로.
-- levels: 초급, 중급, 고급 순서로 정확히 3개. 각 레벨에 summary(과정 요약), entry(시작 조건), exit(수료 기준: 템포·곡·기술로 구체적으로), months를 정확히 ${opts.months}개.
-- 각 month에 title(단원명), goal(목표), units를 정확히 ${opts.perMonth}개. 각 unit은 title, detail(구체적 연습 내용), bpmTarget(예: "♩=90", 해당 없으면 빈 문자열), homework.
-- 기록에 실제로 등장한 루디먼트·그루브·곡·연습법을 최대한 활용하고, 기록이 부족한 레벨(특히 고급)은 앞 단계에서 자연스럽게 이어지는 내용으로 보완하세요.
-모든 문장은 자연스러운 한국어로, 마크다운 기호 없이 쓰세요. JSON 객체 하나로만 답하세요.`;
-}
-
-const unitLines = (u, i) => [
-  `  ${i + 1}회 ${u.done ? "[완료] " : ""}${u.title}${u.bpmTarget ? " (" + u.bpmTarget + ")" : ""}`,
-  ...(u.detail ? [`     ${u.detail}`] : []),
-  ...(u.homework ? [`     과제: ${u.homework}`] : []),
-];
-
-function studentCurrText(c) {
-  const L = [`${c.student} 커리큘럼 (${c.academy || "학원 미정"}) · ${c.createdAt.slice(0, 10)} 작성`, ""];
-  if (c.overview) L.push(c.overview, "");
-  if (c.currentStage) L.push(`현재 단계: ${c.currentStage}`);
-  L.push("", "[앞으로의 커리큘럼]");
-  c.plan.forEach(p => { L.push(`■ ${p.month} — ${p.goal}`); p.units.forEach((u, i) => L.push(...unitLines(u, i))); });
-  if (c.milestones.length) { L.push("", "[도달 목표]"); c.milestones.forEach(m => L.push(`- ${m}`)); }
-  if (c.focus.length) { L.push("", "[보완 포인트]"); c.focus.forEach(f => L.push(`- ${f}`)); }
-  if (c.completed.length) {
-    L.push("", "[지금까지의 과정]");
-    c.completed.forEach(x => L.push(`${x.month} ${x.theme} — ${x.topics.join(", ")}`, ...(x.achievement ? [`  성취: ${x.achievement}`] : [])));
-  }
-  return L.join("\n");
-}
-
-function courseText(c) {
-  const L = [`레벨별 표준 커리큘럼 · ${c.createdAt.slice(0, 10)} 작성 (기록 ${c.basedOn.lessonCount}회 기준)`, "", c.overview];
-  c.levels.forEach(lv => {
-    L.push("", `===== ${lv.level} =====`, lv.summary, `시작 조건: ${lv.entry}`, `수료 기준: ${lv.exit}`);
-    lv.months.forEach((m, i) => {
-      L.push("", `■ ${i + 1}개월차 · ${m.title} — ${m.goal}`);
-      m.units.forEach((u, j) => L.push(...unitLines({ ...u, done: false }, j)));
-    });
-  });
-  return L.join("\n");
-}
-
-function restoreMessage(r) {
-  const parts = [];
-  if (r.lessons) parts.push(`기록 ${r.lessons}개`);
-  if (r.curricula) parts.push(`커리큘럼 ${r.curricula}개`);
-  return parts.length ? `${parts.join(", ")}를 복원했습니다.` : "새로 추가된 기록이 없습니다 (이미 있는 기록).";
-}
-
 /* ---------- small ui bits ---------- */
 const card = "bg-white rounded-2xl border border-slate-200 shadow-sm";
 
@@ -403,20 +166,11 @@ export default function App() {
   const [flt, setFlt] = useState({ academy: "", student: "" });
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
   const [loadWarn, setLoadWarn] = useState(false);
-  const [curricula, setCurriculaState] = useState({});
-  const [currKey, setCurrKey] = useState("");
-  // functional updates keep async AI results from clobbering edits made meanwhile
-  const setCurricula = (fn) => setCurriculaState(prev => {
-    const next = typeof fn === "function" ? fn(prev) : fn;
-    saveCurricula(next);
-    return next;
-  });
   const fileRef = useRef(null);
 
   useEffect(() => {
     loadData().then(res => {
       setLessons(res.data);
-      setCurriculaState(loadCurricula());
       if (res.corrupt) setLoadWarn(true);
       setReady(true);
     });
@@ -537,7 +291,7 @@ export default function App() {
   };
 
   /* ---------- backup / restore ---------- */
-  const buildJSON = () => JSON.stringify({ version: 2, lessons, curricula }, null, 2);
+  const buildJSON = () => JSON.stringify(lessons, null, 2);
   const buildCSV = () => {
     const head = ["날짜","학원","학생","레슨내용","다음과제","메모",...SKILL_KEYS,"레벨","BPM"];
     const rows = lessons.map(l => [
@@ -555,28 +309,23 @@ export default function App() {
       return true;
     } catch { return false; }
   };
-  // accepts old backups (bare lesson array) and v2 ({ version, lessons, curricula }).
-  // returns counts added { lessons, curricula }, or -1 on parse error
+  // returns number added, or -1 on parse error
   const restoreFromText = (text) => {
     try {
-      const data = JSON.parse(text);
-      const list = Array.isArray(data) ? data : Array.isArray(data?.lessons) ? data.lessons : null;
-      if (!list) return -1;
+      const arr = JSON.parse(text);
+      if (!Array.isArray(arr)) return -1;
       const ids = new Set(lessons.map(l => l.id));
-      const add = list.filter(a => a && a.id && !ids.has(a.id));
+      const add = arr.filter(a => a && a.id && !ids.has(a.id));
       if (add.length) commit([...lessons, ...add]);
-      const incoming = !Array.isArray(data) && data.curricula && typeof data.curricula === "object" ? data.curricula : {};
-      const take = Object.entries(incoming).filter(([k, v]) =>
-        v && v.createdAt && (!curricula[k] || v.createdAt > curricula[k].createdAt));
-      if (take.length) setCurricula(prev => ({ ...prev, ...Object.fromEntries(take) }));
-      return { lessons: add.length, curricula: take.length };
+      return add.length;
     } catch { return -1; }
   };
   const importFile = (file) => {
     const r = new FileReader();
     r.onload = () => {
-      const res = restoreFromText(String(r.result));
-      alert(res === -1 ? "올바른 백업(JSON) 내용이 아닙니다." : restoreMessage(res));
+      const n = restoreFromText(String(r.result));
+      if (n < 0) alert("올바른 백업(JSON) 내용이 아닙니다.");
+      else alert(n === 0 ? "새로 추가된 기록이 없습니다 (이미 있는 기록)." : `${n}개 기록을 복원했습니다.`);
     };
     r.readAsText(file);
   };
@@ -592,7 +341,6 @@ export default function App() {
     { k: "list", label: "전체 기록", icon: List },
     { k: "students", label: "학생별", icon: Users },
     { k: "report", label: "월별 리포트", icon: FileText },
-    { k: "curriculum", label: "커리큘럼", icon: GraduationCap },
   ];
 
   return (
@@ -653,7 +401,7 @@ export default function App() {
             <button onClick={() => setLoadWarn(false)} className="ml-2 underline">닫기</button>
           </div>
         )}
-        {lessons.length === 0 && ["dashboard", "list", "students", "report", "curriculum"].includes(tab) && (
+        {lessons.length === 0 && ["dashboard", "list", "students", "report"].includes(tab) && (
           <div className={card + " p-10 text-center"}>
             <div className="text-slate-800 font-semibold text-lg">아직 기록이 없습니다</div>
             <p className="text-slate-500 mt-1 text-sm">레슨 노트 사진을 올려 자동으로 정리하거나, 예시 데이터로 먼저 둘러보세요.</p>
@@ -673,13 +421,9 @@ export default function App() {
           <StudentGrid students={students} onOpen={setSelStudent} />}
         {tab === "students" && selStudent &&
           <StudentDetail s={students.find(x => x.student === selStudent.student && x.academy === selStudent.academy)}
-            onBack={() => setSelStudent(null)} onEdit={startEdit} onDelete={removeEntry}
-            onCurriculum={(st) => { setCurrKey(studentKey(st)); setSelStudent(null); setTab("curriculum"); }} />}
+            onBack={() => setSelStudent(null)} onEdit={startEdit} onDelete={removeEntry} />}
         {tab === "report" && lessons.length > 0 &&
           <MonthlyReport lessons={lessons} students={students} />}
-        {tab === "curriculum" && lessons.length > 0 &&
-          <CurriculumPage lessons={lessons} students={students}
-            curricula={curricula} setCurricula={setCurricula} initialKey={currKey} />}
         {tab === "batch" && batch.length > 0 &&
           <BatchReview batch={batch} setBatch={setBatch} onSaveAll={saveBatch}
             onCancel={() => { setBatch([]); setTab("list"); }}
@@ -730,9 +474,9 @@ function DataPage({ jsonText, csvText, count, onDownload, onRestoreText, onResto
     }
   };
   const doRestore = () => {
-    const r = onRestoreText(pasteVal.trim());
-    if (r === -1) setMsg("붙여넣은 내용이 올바른 백업(JSON)이 아닙니다.");
-    else { setMsg(restoreMessage(r)); setPasteVal(""); }
+    const n = onRestoreText(pasteVal.trim());
+    if (n < 0) setMsg("붙여넣은 내용이 올바른 백업(JSON)이 아닙니다.");
+    else { setMsg(n === 0 ? "새로 추가된 기록이 없습니다 (이미 있는 기록)." : `${n}개 기록을 복원했습니다.`); setPasteVal(""); }
   };
 
   return (
@@ -1008,506 +752,6 @@ function MonthlyReport({ lessons, students }) {
   );
 }
 
-/* ================= Curriculum ================= */
-function CurriculumPage({ lessons, students, curricula, setCurricula, initialKey }) {
-  const sorted = useMemo(() => [...students].sort((a, b) => b.count - a.count), [students]);
-  const [mode, setMode] = useState("student"); // student | course
-  const [selKey, setSelKey] = useState(initialKey || (sorted[0] ? studentKey(sorted[0]) : ""));
-  const seg = (m, label, Icon) => (
-    <button onClick={() => setMode(m)}
-      className={"px-4 py-2 text-sm font-medium rounded-lg flex items-center gap-1.5 " +
-        (mode === m ? "bg-white shadow-sm text-slate-900" : "text-slate-500 hover:text-slate-700")}>
-      <Icon size={15} /> {label}
-    </button>
-  );
-  return (
-    <div className="space-y-5">
-      <div className="inline-flex p-1 rounded-xl bg-slate-200/70">
-        {seg("student", "학생별 커리큘럼", Users)}
-        {seg("course", "레벨별 표준 과정", GraduationCap)}
-      </div>
-      {mode === "student"
-        ? <StudentCurriculum sorted={sorted} selKey={selKey} setSelKey={setSelKey}
-            curricula={curricula} setCurricula={setCurricula} />
-        : <CourseCurriculum lessons={lessons} curricula={curricula} setCurricula={setCurricula} />}
-    </div>
-  );
-}
-
-const optSel = "border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white disabled:opacity-50";
-
-function OptField({ label, children }) {
-  return (
-    <label className="block">
-      <div className="text-xs font-medium text-slate-500 mb-1">{label}</div>
-      {children}
-    </label>
-  );
-}
-
-function GenButton({ busy, exists, onClick }) {
-  return (
-    <button onClick={onClick} disabled={busy}
-      className="ml-auto px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
-      {busy ? <Loader2 className="animate-spin" size={15} /> : exists ? <RefreshCw size={15} /> : <Sparkles size={15} />}
-      {busy ? "생성 중…" : exists ? "다시 생성" : "AI 커리큘럼 생성"}
-    </button>
-  );
-}
-
-function GenStatus({ busy, chars }) {
-  if (!busy) return null;
-  return (
-    <div className={card + " p-4 flex items-center gap-3 text-sm text-slate-600"}>
-      <Loader2 className="animate-spin text-amber-500 shrink-0" size={18} />
-      <span>{chars
-        ? `커리큘럼 작성 중… ${chars.toLocaleString()}자`
-        : "월별 기록을 분석하는 중… 보통 1분 안팎 걸려요. 다른 탭으로 옮겨도 계속 진행됩니다."}</span>
-    </div>
-  );
-}
-
-function Progress({ done, total }) {
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  return (
-    <div className="flex items-center gap-2">
-      <div className="flex-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
-        <div className="h-full bg-teal-500 rounded-full transition-all" style={{ width: pct + "%" }} />
-      </div>
-      <span className="text-xs text-slate-500 tabular-nums w-10 text-right">{done}/{total}</span>
-    </div>
-  );
-}
-
-function UnitList({ units, onToggle }) {
-  return (
-    <ol className="space-y-2">
-      {units.map((u, i) => (
-        <li key={u.id} className={"flex gap-3 p-3 rounded-xl border " +
-          (u.done ? "bg-slate-50 border-slate-100" : "bg-white border-slate-200")}>
-          {onToggle ? (
-            <button onClick={() => onToggle(u.id)} aria-label={u.done ? "완료 취소" : "완료 표시"}
-              className="shrink-0 w-9 h-9 -m-1.5 grid place-items-center">
-              {u.done ? <CheckCircle2 size={22} className="text-teal-600" /> : <Circle size={22} className="text-slate-300" />}
-            </button>
-          ) : (
-            <span className="shrink-0 w-6 h-6 rounded-full bg-slate-100 text-slate-500 text-xs font-semibold grid place-items-center tabular-nums">{i + 1}</span>
-          )}
-          <div className="flex-1 min-w-0">
-            <div className="flex items-baseline gap-2 flex-wrap">
-              {onToggle && <span className="text-xs text-slate-400 tabular-nums">{i + 1}회</span>}
-              <span className={"font-medium " + (u.done ? "line-through text-slate-400" : "text-slate-800")}>{u.title}</span>
-              {u.bpmTarget && <span className="text-xs font-medium text-amber-600">{u.bpmTarget}</span>}
-            </div>
-            {u.detail && <p className={"text-sm mt-0.5 leading-relaxed " + (u.done ? "text-slate-400" : "text-slate-600")}>{u.detail}</p>}
-            {u.homework && <p className="text-xs text-teal-700 mt-1">과제 · {u.homework}</p>}
-          </div>
-        </li>
-      ))}
-    </ol>
-  );
-}
-
-function MonthlyFlow({ flow, withNames }) {
-  return (
-    <div className={card + " p-5"}>
-      <h3 className="font-semibold text-slate-700">월별 레슨 기록</h3>
-      <p className="text-xs text-slate-400 mb-4">커리큘럼은 이 기록을 근거로 만들어집니다.</p>
-      <div className="space-y-4">
-        {flow.map(f => {
-          const shown = withNames ? f.entries.slice(0, 6) : f.entries;
-          return (
-            <div key={f.month} className="flex gap-3">
-              <div className="w-16 shrink-0 text-sm font-semibold tabular-nums text-slate-600 pt-0.5">{f.month}</div>
-              <div className="flex-1 min-w-0 border-l-2 border-slate-200 pl-3">
-                <div className="flex flex-wrap gap-x-2.5 gap-y-1 items-center text-xs text-slate-500">
-                  <span className="font-medium text-slate-700">{f.count}회</span>
-                  {withNames
-                    ? <>
-                        <span>학생 {f.students}명</span>
-                        {LEVELS.filter(l => f.levels[l]).map(l => <span key={l}>{l} {f.levels[l]}</span>)}
-                      </>
-                    : <LevelPill level={f.level} />}
-                  {f.bpmMin != null && (
-                    <span className="text-amber-600">♩ {f.bpmMin === f.bpmMax ? f.bpmMin : `${f.bpmMin}~${f.bpmMax}`}</span>
-                  )}
-                  {!withNames && SKILL_KEYS.map((sk, i) => f.avg[sk] != null && (
-                    <span key={sk} style={{ color: SKILL_COLORS[i] }}>{sk} {f.avg[sk]}</span>
-                  ))}
-                </div>
-                <ul className="mt-1.5 space-y-0.5 text-sm text-slate-700">
-                  {shown.map(e => (
-                    <li key={e.id} className="flex gap-2">
-                      <span className="text-slate-400 tabular-nums shrink-0">{e.date.slice(5)}</span>
-                      {withNames && <span className="text-slate-500 shrink-0">{e.student}</span>}
-                      <span className="min-w-0">{e.content || "-"}</span>
-                    </li>
-                  ))}
-                </ul>
-                {shown.length < f.entries.length && (
-                  <div className="text-xs text-slate-400 mt-1">외 {f.entries.length - shown.length}건</div>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function useCopy() {
-  const [copied, setCopied] = useState(false);
-  const copy = async (text) => {
-    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 2000); }
-    catch { alert("복사하지 못했습니다. 브라우저 권한을 확인하세요."); }
-  };
-  return [copied, copy];
-}
-
-function CurrHeader({ title, sub, stale, copied, onCopy, onDelete, children }) {
-  return (
-    <div className={card + " p-5 space-y-3"}>
-      <div className="flex items-start gap-3 flex-wrap">
-        <div>
-          <h2 className="text-xl font-bold text-slate-800">{title}</h2>
-          <div className="text-xs text-slate-400 mt-0.5">{sub}</div>
-        </div>
-        <div className="ml-auto flex gap-2">
-          <button onClick={onCopy} className="px-3 py-2 rounded-lg border border-slate-300 text-sm flex items-center gap-1.5">
-            <Copy size={14} /> {copied ? "복사됨!" : "복사"}
-          </button>
-          <button onClick={onDelete} className="px-3 py-2 rounded-lg border border-slate-300 text-sm text-slate-500 hover:text-rose-600 flex items-center gap-1.5">
-            <Trash2 size={14} /> 삭제
-          </button>
-        </div>
-      </div>
-      {stale > 0 && (
-        <div className="text-sm rounded-lg bg-amber-50 border border-amber-200 text-amber-800 px-3 py-2">
-          이 커리큘럼을 만든 뒤 새 기록이 {stale}개 추가됐어요. "다시 생성"하면 반영됩니다.
-        </div>
-      )}
-      {children}
-    </div>
-  );
-}
-
-function StudentCurriculum({ sorted, selKey, setSelKey, curricula, setCurricula }) {
-  const s = sorted.find(x => studentKey(x) === selKey) || sorted[0];
-  const k = s ? studentKey(s) : "";
-  const flow = useMemo(() => (s ? monthlyFlow(s.entries) : []), [s]);
-  const avgPerMonth = flow.length ? clampInt(s.count / flow.length, 1, 8) : 4;
-  const [horizon, setHorizon] = useState(3);
-  const [perMonth, setPerMonth] = useState(avgPerMonth);
-  const [busy, setBusy] = useState(false);
-  const [chars, setChars] = useState(0);
-  const [err, setErr] = useState("");
-  const [copied, copy] = useCopy();
-  useEffect(() => { setPerMonth(avgPerMonth); setErr(""); }, [k]);
-  if (!s) return null;
-
-  const cur = curricula[k];
-  const start = planStart(flow[flow.length - 1].month);
-  const allUnits = cur ? cur.plan.flatMap(p => p.units) : [];
-  const doneCount = allUnits.filter(u => u.done).length;
-
-  const generate = async () => {
-    if (doneCount && !confirm("새 계획으로 다시 만듭니다. 완료 체크한 단원은 새 커리큘럼에 반영돼요. 계속할까요?")) return;
-    const target = k, h = horizon, pm = perMonth, st = start, snap = s, fl = flow;
-    setBusy(true); setErr(""); setChars(0);
-    try {
-      const raw = await callJSON(buildStudentPrompt(snap, fl, { horizon: h, perMonth: pm, start: st }, cur),
-        STUDENT_CURR_SCHEMA, setChars);
-      const months = Array.from({ length: h }, (_, i) => addMonths(st, i));
-      const next = {
-        key: target, student: snap.student, academy: snap.academy,
-        createdAt: new Date().toISOString(),
-        basedOn: { lessonCount: snap.count, lastDate: snap.entries[snap.entries.length - 1].date, months: fl.map(f => f.month) },
-        horizon: h, perMonth: pm,
-        overview: asStr(raw.overview), currentStage: asStr(raw.currentStage),
-        completed: asArr(raw.completed).map(x => ({
-          month: asStr(x?.month), theme: asStr(x?.theme), topics: asArr(x?.topics).map(asStr), achievement: asStr(x?.achievement),
-        })),
-        focus: asArr(raw.focus).map(asStr),
-        plan: asArr(raw.plan).slice(0, h).map((p, i) => ({ month: months[i], goal: asStr(p?.goal), units: asArr(p?.units).map(normUnit) })),
-        milestones: asArr(raw.milestones).map(asStr),
-      };
-      if (!next.plan.length) throw new Error("EMPTY");
-      setCurricula(prev => ({ ...prev, [target]: next }));
-    } catch (e) { setErr(aiErrorText(e)); }
-    setBusy(false);
-  };
-
-  const toggle = (uid) => setCurricula(prev => {
-    const c = prev[k]; if (!c) return prev;
-    return { ...prev, [k]: { ...c, plan: c.plan.map(p => ({ ...p, units: p.units.map(u => u.id === uid ? { ...u, done: !u.done } : u) })) } };
-  });
-  const remove = () => {
-    if (!confirm(`${s.student} 학생의 커리큘럼을 삭제할까요?`)) return;
-    setCurricula(prev => { const n = { ...prev }; delete n[k]; return n; });
-  };
-
-  return (
-    <div className="space-y-5">
-      <div className={card + " p-4 space-y-2"}>
-        <div className="flex flex-wrap items-end gap-3">
-          <OptField label="학생">
-            <select className={optSel} value={k} disabled={busy} onChange={e => setSelKey(e.target.value)}>
-              {sorted.map(x => (
-                <option key={studentKey(x)} value={studentKey(x)}>
-                  {x.student}{x.academy ? ` · ${x.academy}` : ""} ({x.count}회)
-                </option>
-              ))}
-            </select>
-          </OptField>
-          <OptField label="계획 기간">
-            <select className={optSel} value={horizon} disabled={busy} onChange={e => setHorizon(Number(e.target.value))}>
-              {[1, 2, 3, 6].map(n => <option key={n} value={n}>{n}개월</option>)}
-            </select>
-          </OptField>
-          <OptField label="월 레슨 횟수">
-            <select className={optSel} value={perMonth} disabled={busy} onChange={e => setPerMonth(Number(e.target.value))}>
-              {[1, 2, 3, 4, 5, 6, 7, 8].map(n => <option key={n} value={n}>{n}회{n === avgPerMonth ? " (기록 평균)" : ""}</option>)}
-            </select>
-          </OptField>
-          <GenButton busy={busy} exists={!!cur} onClick={generate} />
-        </div>
-        <p className="text-xs text-slate-400">
-          {flow.length}개월 · {s.count}회 기록을 바탕으로 {start}부터 {horizon}개월 계획을 만듭니다.
-        </p>
-      </div>
-
-      <GenStatus busy={busy} chars={chars} />
-      {err && <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{err}</div>}
-
-      {cur ? (
-        <>
-          <CurrHeader
-            title={`${cur.student} 커리큘럼`}
-            sub={`${cur.createdAt.slice(0, 10)} 작성 · 기록 ${cur.basedOn.lessonCount}회 기준 · ${cur.plan[0]?.month} ~ ${cur.plan[cur.plan.length - 1]?.month}`}
-            stale={s.count - (cur.basedOn?.lessonCount || 0)}
-            copied={copied} onCopy={() => copy(studentCurrText(cur))} onDelete={remove}>
-            {cur.overview && <p className="text-sm text-slate-700 leading-relaxed">{cur.overview}</p>}
-            {cur.currentStage && (
-              <div className="flex gap-2 text-sm text-slate-700 bg-slate-50 rounded-lg p-3">
-                <Target size={16} className="text-amber-500 shrink-0 mt-0.5" />
-                <span><b className="font-semibold">현재 단계</b> · {cur.currentStage}</span>
-              </div>
-            )}
-            <div>
-              <div className="text-xs text-slate-500 mb-1">전체 진행</div>
-              <Progress done={doneCount} total={allUnits.length} />
-            </div>
-          </CurrHeader>
-
-          <h3 className="font-semibold text-slate-700 flex items-center gap-1.5 px-1 pt-1">
-            <CalendarRange size={16} /> 앞으로의 커리큘럼
-          </h3>
-          {cur.plan.map((p, pi) => (
-            <div key={p.month + pi} className={card + " p-5"}>
-              <div className="flex items-baseline gap-2 mb-1">
-                <span className="text-base font-bold tabular-nums text-slate-800">{p.month}</span>
-                <span className="text-xs text-slate-400">{pi + 1}개월차</span>
-              </div>
-              {p.goal && (
-                <div className="flex gap-2 text-sm text-slate-700 mb-3">
-                  <Flag size={15} className="text-teal-600 shrink-0 mt-0.5" /> {p.goal}
-                </div>
-              )}
-              <div className="mb-3"><Progress done={p.units.filter(u => u.done).length} total={p.units.length} /></div>
-              <UnitList units={p.units} onToggle={toggle} />
-            </div>
-          ))}
-
-          <div className="grid md:grid-cols-2 gap-5">
-            <div className={card + " p-5"}>
-              <h3 className="font-semibold text-slate-700 mb-3">지금까지의 과정</h3>
-              <div className="space-y-3">
-                {cur.completed.map((c, i) => (
-                  <div key={i} className="border-l-2 border-amber-300 pl-3">
-                    <div className="flex items-baseline gap-2 flex-wrap">
-                      <span className="text-xs tabular-nums text-slate-400">{c.month}</span>
-                      <span className="font-medium text-slate-800">{c.theme}</span>
-                    </div>
-                    {c.topics.length > 0 && (
-                      <div className="flex flex-wrap gap-1 mt-1">
-                        {c.topics.map((t, j) => <span key={j} className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">{t}</span>)}
-                      </div>
-                    )}
-                    {c.achievement && <p className="text-xs text-slate-500 mt-1">{c.achievement}</p>}
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="space-y-5">
-              {cur.milestones.length > 0 && (
-                <div className={card + " p-5"}>
-                  <h3 className="font-semibold text-slate-700 mb-2">계획을 마치면 도달할 목표</h3>
-                  <ul className="space-y-1.5 text-sm text-slate-700">
-                    {cur.milestones.map((m, i) => (
-                      <li key={i} className="flex gap-2"><CheckCircle2 size={15} className="text-teal-600 shrink-0 mt-0.5" />{m}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {cur.focus.length > 0 && (
-                <div className={card + " p-5"}>
-                  <h3 className="font-semibold text-slate-700 mb-2">보완 포인트</h3>
-                  <ul className="space-y-1.5 text-sm text-slate-700">
-                    {cur.focus.map((f, i) => <li key={i} className="flex gap-2"><span className="text-rose-400">•</span>{f}</li>)}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </div>
-        </>
-      ) : !busy && (
-        <div className={card + " p-6 text-center"}>
-          <GraduationCap size={28} className="mx-auto text-slate-300" />
-          <div className="font-semibold text-slate-800 mt-2">아직 {s.student} 학생의 커리큘럼이 없습니다</div>
-          <p className="text-sm text-slate-500 mt-1">
-            위에서 "AI 커리큘럼 생성"을 누르면 아래 월별 기록을 분석해 지금까지의 과정 정리와 다음 달부터의 회차별 계획을 만들어요.
-          </p>
-        </div>
-      )}
-
-      <MonthlyFlow flow={flow} />
-    </div>
-  );
-}
-
-function CourseCurriculum({ lessons, curricula, setCurricula }) {
-  const flow = useMemo(() => monthlyFlow(lessons), [lessons]);
-  const studentCount = useMemo(() => new Set(lessons.map(studentKey)).size, [lessons]);
-  const avgPerMonth = useMemo(() => {
-    const pairs = new Set(lessons.map(l => `${studentKey(l)}||${ym(l.date)}`)).size;
-    return pairs ? clampInt(lessons.length / pairs, 1, 8) : 4;
-  }, [lessons]);
-  const [months, setMonths] = useState(3);
-  const [perMonth, setPerMonth] = useState(avgPerMonth);
-  const [busy, setBusy] = useState(false);
-  const [chars, setChars] = useState(0);
-  const [err, setErr] = useState("");
-  const [level, setLevel] = useState(LEVELS[0]);
-  const [copied, copy] = useCopy();
-  const cur = curricula[COURSE_KEY];
-
-  const generate = async () => {
-    const m = months, pm = perMonth;
-    setBusy(true); setErr(""); setChars(0);
-    try {
-      const raw = await callJSON(buildCoursePrompt(flow, { months: m, perMonth: pm }), COURSE_SCHEMA, setChars);
-      const got = asArr(raw.levels);
-      const levels = LEVELS.map(lv => got.find(x => x?.level === lv)).filter(Boolean).map(lv => ({
-        level: lv.level, summary: asStr(lv.summary), entry: asStr(lv.entry), exit: asStr(lv.exit),
-        months: asArr(lv.months).slice(0, m).map(mo => ({ title: asStr(mo?.title), goal: asStr(mo?.goal), units: asArr(mo?.units).map(normUnit) })),
-      }));
-      if (!levels.length) throw new Error("EMPTY");
-      setCurricula(prev => ({
-        ...prev,
-        [COURSE_KEY]: {
-          key: COURSE_KEY, createdAt: new Date().toISOString(),
-          basedOn: { lessonCount: lessons.length, students: studentCount, months: flow.map(f => f.month) },
-          months: m, perMonth: pm, overview: asStr(raw.overview), levels,
-        },
-      }));
-    } catch (e) { setErr(aiErrorText(e)); }
-    setBusy(false);
-  };
-  const remove = () => {
-    if (!confirm("레벨별 표준 커리큘럼을 삭제할까요?")) return;
-    setCurricula(prev => { const n = { ...prev }; delete n[COURSE_KEY]; return n; });
-  };
-  const lv = cur ? (cur.levels.find(x => x.level === level) || cur.levels[0]) : null;
-
-  return (
-    <div className="space-y-5">
-      <div className={card + " p-4 space-y-2"}>
-        <div className="flex flex-wrap items-end gap-3">
-          <OptField label="레벨당 기간">
-            <select className={optSel} value={months} disabled={busy} onChange={e => setMonths(Number(e.target.value))}>
-              {[2, 3, 4].map(n => <option key={n} value={n}>{n}개월</option>)}
-            </select>
-          </OptField>
-          <OptField label="월 레슨 횟수">
-            <select className={optSel} value={perMonth} disabled={busy} onChange={e => setPerMonth(Number(e.target.value))}>
-              {[1, 2, 3, 4, 5, 6].map(n => <option key={n} value={n}>{n}회{n === avgPerMonth ? " (기록 평균)" : ""}</option>)}
-            </select>
-          </OptField>
-          <GenButton busy={busy} exists={!!cur} onClick={generate} />
-        </div>
-        <p className="text-xs text-slate-400">
-          전체 {lessons.length}회 · {flow.length}개월 · 학생 {studentCount}명의 기록을 분석해 초급·중급·고급 표준 과정을 만듭니다.
-        </p>
-      </div>
-
-      <GenStatus busy={busy} chars={chars} />
-      {err && <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">{err}</div>}
-
-      {cur && lv ? (
-        <>
-          <CurrHeader
-            title="레벨별 표준 커리큘럼"
-            sub={`${cur.createdAt.slice(0, 10)} 작성 · 기록 ${cur.basedOn.lessonCount}회 · 학생 ${cur.basedOn.students}명 기준 · 레벨당 ${cur.months}개월`}
-            stale={lessons.length - (cur.basedOn?.lessonCount || 0)}
-            copied={copied} onCopy={() => copy(courseText(cur))} onDelete={remove}>
-            {cur.overview && <p className="text-sm text-slate-700 leading-relaxed">{cur.overview}</p>}
-          </CurrHeader>
-
-          <div className="inline-flex p-1 rounded-xl bg-slate-200/70">
-            {cur.levels.map(x => (
-              <button key={x.level} onClick={() => setLevel(x.level)}
-                className={"px-5 py-2 text-sm font-medium rounded-lg " +
-                  (lv.level === x.level ? "bg-white shadow-sm text-slate-900" : "text-slate-500 hover:text-slate-700")}>
-                {x.level}
-              </button>
-            ))}
-          </div>
-
-          <div className={card + " p-5 space-y-3"}>
-            <div className="flex items-center gap-2"><LevelPill level={lv.level} /><span className="text-sm text-slate-700">{lv.summary}</span></div>
-            <div className="grid sm:grid-cols-2 gap-3">
-              <div className="rounded-lg bg-slate-50 p-3">
-                <div className="text-xs font-medium text-slate-500 mb-0.5">시작 조건</div>
-                <div className="text-sm text-slate-700">{lv.entry}</div>
-              </div>
-              <div className="rounded-lg bg-teal-50 p-3">
-                <div className="text-xs font-medium text-teal-700 mb-0.5">수료 기준</div>
-                <div className="text-sm text-slate-700">{lv.exit}</div>
-              </div>
-            </div>
-          </div>
-
-          {lv.months.map((mo, i) => (
-            <div key={i} className={card + " p-5"}>
-              <div className="flex items-baseline gap-2 mb-1 flex-wrap">
-                <span className="text-xs text-slate-400">{lv.level} {i + 1}개월차</span>
-                <span className="text-base font-bold text-slate-800">{mo.title}</span>
-              </div>
-              {mo.goal && (
-                <div className="flex gap-2 text-sm text-slate-700 mb-3">
-                  <Flag size={15} className="text-teal-600 shrink-0 mt-0.5" /> {mo.goal}
-                </div>
-              )}
-              <UnitList units={mo.units} />
-            </div>
-          ))}
-        </>
-      ) : !busy && (
-        <div className={card + " p-6 text-center"}>
-          <GraduationCap size={28} className="mx-auto text-slate-300" />
-          <div className="font-semibold text-slate-800 mt-2">아직 표준 과정이 없습니다</div>
-          <p className="text-sm text-slate-500 mt-1">
-            모든 학생의 월별 기록에서 실제로 가르친 내용과 성장 순서를 뽑아, 새 학생에게 쓸 수 있는 초급·중급·고급 과정으로 정리해요.
-          </p>
-        </div>
-      )}
-
-      <MonthlyFlow flow={flow} withNames />
-    </div>
-  );
-}
-
 /* ================= List ================= */
 function ListView({ lessons, flt, setFlt, academies, onEdit, onDelete }) {
   const students = [...new Set(lessons.filter(l => !flt.academy || l.academy === flt.academy).map(l => l.student))];
@@ -1594,7 +838,7 @@ function StudentGrid({ students, onOpen }) {
 }
 
 /* ================= Student detail ================= */
-function StudentDetail({ s, onBack, onEdit, onDelete, onCurriculum }) {
+function StudentDetail({ s, onBack, onEdit, onDelete }) {
   if (!s) return null;
   const trend = s.entries.map(e => ({
     date: e.date.slice(5), ...e.skills, bpm: Number(e.bpm) || null,
@@ -1611,12 +855,6 @@ function StudentDetail({ s, onBack, onEdit, onDelete, onCurriculum }) {
         <h2 className="text-2xl font-bold text-slate-800">{s.student}</h2>
         <LevelPill level={s.level} />
         <span className="text-slate-400 text-sm">{s.academy} · 총 {s.count}회</span>
-        {onCurriculum && (
-          <button onClick={() => onCurriculum(s)}
-            className="ml-auto px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm flex items-center gap-1.5 hover:border-amber-400">
-            <GraduationCap size={15} /> 커리큘럼
-          </button>
-        )}
       </div>
 
       <div className="grid md:grid-cols-2 gap-5">
