@@ -193,8 +193,8 @@ async function uploadToDrive(lessons) {
 }
 
 // "#connect=<base64url JSON {u, k}>" links are produced by the PC setup script
-function readConnectLink() {
-  const m = location.hash.match(/^#connect=([\w-]+)$/);
+function parseConnect(text) {
+  const m = String(text || "").match(/#connect=([\w-]+)/);
   if (!m) return null;
   try {
     const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
@@ -202,6 +202,7 @@ function readConnectLink() {
     return obj && obj.u && obj.k ? obj : null;
   } catch { return null; }
 }
+const readConnectLink = () => (/^#connect=[\w-]+$/.test(location.hash) ? parseConnect(location.hash) : null);
 
 /* ---------- small ui bits ---------- */
 const card = "bg-white rounded-2xl border border-slate-200 shadow-sm";
@@ -252,7 +253,12 @@ export default function App() {
       const link = readConnectLink();
       if (link) {
         history.replaceState(null, "", location.pathname + location.search);
-        if (confirm("구글 드라이브 자동 백업을 연결할까요?\n이 기기의 레슨 기록이 내 구글 드라이브에 저장됩니다.")) {
+        // iOS keeps separate storage for Safari and a home-screen web app; links always open in Safari
+        const standalone = navigator.standalone === true || matchMedia("(display-mode: standalone)").matches;
+        const hint = standalone ? "" :
+          "\n\n※ 홈 화면에 추가한 앱으로 레슨을 기록한다면 사파리와 앱은 기록이 따로 저장됩니다. " +
+          "이 링크를 복사해 앱의 [설정 → 구글 드라이브 자동 백업 → 웹 앱 URL] 칸에 붙여넣으세요.";
+        if (confirm("구글 드라이브 자동 백업을 연결할까요?\n이 기기의 레슨 기록이 내 구글 드라이브에 저장됩니다." + hint)) {
           lsSet(DRIVE_URL_STORAGE, link.u);
           lsSet(DRIVE_KEY_STORAGE, link.k);
           if (!hasData) { alert("연결했습니다. 레슨을 저장하면 드라이브에 백업됩니다."); return; }
@@ -262,10 +268,9 @@ export default function App() {
           return;
         }
       }
-      // never auto-upload an empty or unreadable list over the Drive copy
-      const last = readDriveLast();
-      const stale = !last || Date.now() - Date.parse(last.at) > 24 * 3600e3;
-      if (getDriveConfig().url && hasData && (lsGet(DRIVE_PENDING_STORAGE) || stale)) backupToDrive(res.data);
+      // retry only this device's unsent saves. Merely opening the app must never upload:
+      // another storage (Safari vs. home-screen app) may hold an older, smaller list.
+      if (getDriveConfig().url && hasData && lsGet(DRIVE_PENDING_STORAGE)) backupToDrive(res.data);
     });
   }, []);
 
@@ -1442,6 +1447,14 @@ function SettingsPage({ onBack, lessons, driveLast, onDriveBackup }) {
     setDriveBusy(false);
   };
   const when = (iso) => new Date(iso).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  // the whole connect link may be pasted into the URL field (home-screen apps can't open links)
+  const onUrlInput = (v) => {
+    const link = parseConnect(v);
+    if (!link) { setDriveUrl(v); return; }
+    setDriveUrl(link.u);
+    setDriveKey(link.k);
+    setDriveMsg("연동 링크를 인식했습니다. '저장하고 지금 백업'을 누르세요.");
+  };
   const save = () => {
     try {
       if (key.trim()) localStorage.setItem(API_KEY_STORAGE, key.trim());
@@ -1494,8 +1507,8 @@ function SettingsPage({ onBack, lessons, driveLast, onDriveBackup }) {
         </div>
         <div>
           <div className="text-xs font-medium text-slate-500 mb-1">웹 앱 URL</div>
-          <input className={inp} value={driveUrl} onChange={e => setDriveUrl(e.target.value)}
-            placeholder="https://script.google.com/macros/s/.../exec" autoComplete="off" />
+          <input className={inp} value={driveUrl} onChange={e => onUrlInput(e.target.value)}
+            placeholder="웹 앱 URL 또는 아이패드 연동 링크 붙여넣기" autoComplete="off" />
         </div>
         <div>
           <div className="text-xs font-medium text-slate-500 mb-1">연동 키</div>
