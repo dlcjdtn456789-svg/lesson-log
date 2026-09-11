@@ -8,7 +8,7 @@ import {
   LayoutDashboard, List, Users, PlusCircle, Upload, Loader2, Download,
   Trash2, Pencil, ChevronLeft, Music4, Save, FileText, PenLine,
   Eraser, RotateCcw, Sparkles, Maximize2, Minimize2,
-  Settings, KeyRound, ExternalLink,
+  Settings, KeyRound, ExternalLink, CloudUpload,
 } from "lucide-react";
 
 const SKILL_KEYS = ["리듬", "테크닉", "독보", "표현", "완성도"];
@@ -144,6 +144,65 @@ async function parseImage(src) {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
+/* ---------- Google Drive auto-backup (via the user's own Apps Script web app) ---------- */
+const DRIVE_URL_STORAGE = "lesson_drive_url";
+const DRIVE_KEY_STORAGE = "lesson_drive_key";
+const DRIVE_LAST_STORAGE = "lesson_drive_last";
+const DRIVE_PENDING_STORAGE = "lesson_drive_pending";
+
+const lsGet = (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
+const lsSet = (k, v) => { try { if (v) localStorage.setItem(k, v); else localStorage.removeItem(k); } catch {} };
+const getDriveConfig = () => ({ url: lsGet(DRIVE_URL_STORAGE), key: lsGet(DRIVE_KEY_STORAGE) });
+function readDriveLast() {
+  try { return JSON.parse(lsGet(DRIVE_LAST_STORAGE) || "null"); } catch { return null; }
+}
+
+// POSTs the whole lesson list; the Apps Script saves it into the user's Drive.
+// text/plain keeps it a simple request (Apps Script cannot answer CORS preflights).
+async function uploadToDrive(lessons) {
+  const { url, key } = getDriveConfig();
+  if (!url || !key) return null;
+  const at = new Date().toISOString();
+  const body = JSON.stringify({ key, lessons });
+  const headers = { "content-type": "text/plain;charset=utf-8" };
+  let result, resp = null;
+  try {
+    resp = await fetch(url, { method: "POST", headers, body });
+  } catch {
+    // no readable reply: offline, or the browser hid it (CORS). Only the latter is worth a blind resend.
+    if (!navigator.onLine) result = { at, ok: false, error: "인터넷에 연결되어 있지 않습니다" };
+    else {
+      try {
+        await fetch(url, { method: "POST", mode: "no-cors", headers, body });
+        result = { at, ok: true, unconfirmed: true, count: lessons.length };
+      } catch {
+        result = { at, ok: false, error: "네트워크에 연결할 수 없습니다" };
+      }
+    }
+  }
+  if (resp) {
+    let data = null;
+    try { data = await resp.json(); } catch {}
+    result = !data ? { at, ok: false, error: `웹 앱 URL의 응답이 올바르지 않습니다 (HTTP ${resp.status})` }
+      : data.ok ? { at, ok: true, count: data.count }
+      : { at, ok: false, error: data.error === "unauthorized" ? "연동 키가 맞지 않습니다" : (data.error || "드라이브 응답 오류") };
+  }
+  lsSet(DRIVE_LAST_STORAGE, JSON.stringify(result));
+  lsSet(DRIVE_PENDING_STORAGE, result.ok ? "" : "1");
+  return result;
+}
+
+// "#connect=<base64url JSON {u, k}>" links are produced by the PC setup script
+function readConnectLink() {
+  const m = location.hash.match(/^#connect=([\w-]+)$/);
+  if (!m) return null;
+  try {
+    const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+    const obj = JSON.parse(atob(b64 + "===".slice((b64.length + 3) % 4)));
+    return obj && obj.u && obj.k ? obj : null;
+  } catch { return null; }
+}
+
 /* ---------- small ui bits ---------- */
 const card = "bg-white rounded-2xl border border-slate-200 shadow-sm";
 
@@ -166,13 +225,47 @@ export default function App() {
   const [flt, setFlt] = useState({ academy: "", student: "" });
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
   const [loadWarn, setLoadWarn] = useState(false);
+  const [driveLast, setDriveLast] = useState(readDriveLast);
+  const driveTimer = useRef(null);
   const fileRef = useRef(null);
+
+  const backupToDrive = async (list) => {
+    clearTimeout(driveTimer.current);
+    const r = await uploadToDrive(list);
+    if (r) setDriveLast(r);
+    return r;
+  };
+  // debounce bursts of edits into one upload; the pending flag retries on the next app open
+  const scheduleDrive = (list) => {
+    if (!getDriveConfig().url) return;
+    lsSet(DRIVE_PENDING_STORAGE, "1");
+    clearTimeout(driveTimer.current);
+    driveTimer.current = setTimeout(() => backupToDrive(list), 3000);
+  };
 
   useEffect(() => {
     loadData().then(res => {
       setLessons(res.data);
       if (res.corrupt) setLoadWarn(true);
       setReady(true);
+      const hasData = res.ok && !res.corrupt && res.data.length > 0;
+      const link = readConnectLink();
+      if (link) {
+        history.replaceState(null, "", location.pathname + location.search);
+        if (confirm("구글 드라이브 자동 백업을 연결할까요?\n이 기기의 레슨 기록이 내 구글 드라이브에 저장됩니다.")) {
+          lsSet(DRIVE_URL_STORAGE, link.u);
+          lsSet(DRIVE_KEY_STORAGE, link.k);
+          if (!hasData) { alert("연결했습니다. 레슨을 저장하면 드라이브에 백업됩니다."); return; }
+          backupToDrive(res.data).then(r => r && alert(r.ok
+            ? `연결했습니다. 구글 드라이브에 ${r.count}개 기록을 백업했습니다.`
+            : `연결은 저장했지만 백업에 실패했습니다: ${r.error}`));
+          return;
+        }
+      }
+      // never auto-upload an empty or unreadable list over the Drive copy
+      const last = readDriveLast();
+      const stale = !last || Date.now() - Date.parse(last.at) > 24 * 3600e3;
+      if (getDriveConfig().url && hasData && (lsGet(DRIVE_PENDING_STORAGE) || stale)) backupToDrive(res.data);
     });
   }, []);
 
@@ -180,6 +273,7 @@ export default function App() {
     setSaveState("saving");
     const ok = await saveData(list);
     setSaveState(ok ? "saved" : "error");
+    if (ok) scheduleDrive(list);
   };
   const commit = (next) => { setLessons(next); persist(next); };
 
@@ -367,7 +461,7 @@ export default function App() {
             <div className="text-[11px] text-slate-400 leading-none mt-0.5">드럼 레슨 관리 · 실력 통계</div>
           </div>
           <div className="ml-auto flex items-center gap-2">
-            <SaveChip state={saveState} count={lessons.length} />
+            <SaveChip state={saveState} count={lessons.length} drive={driveLast} />
             <button onClick={() => { setTab("settings"); setSelStudent(null); }} className="text-xs px-3 py-2 rounded-lg hover:bg-slate-800 flex items-center gap-1.5 text-slate-300">
               <Settings size={14} /> 설정
             </button>
@@ -434,7 +528,8 @@ export default function App() {
             onImage={onImage} onDrawing={onDrawing} parsing={parsing} parseErr={parseErr}
             academies={academies} students={students} />}
         {tab === "settings" &&
-          <SettingsPage onBack={() => setTab("dashboard")} />}
+          <SettingsPage onBack={() => setTab("dashboard")}
+            lessons={lessons} driveLast={driveLast} onDriveBackup={backupToDrive} />}
         {tab === "data" &&
           <DataPage
             jsonText={buildJSON()} csvText={buildCSV()} count={lessons.length}
@@ -446,7 +541,7 @@ export default function App() {
 }
 
 /* ================= Save status chip ================= */
-function SaveChip({ state, count }) {
+function SaveChip({ state, count, drive }) {
   const map = {
     idle: { t: `${count}개 저장됨`, c: "text-slate-400" },
     saving: { t: "저장 중…", c: "text-amber-300" },
@@ -454,7 +549,12 @@ function SaveChip({ state, count }) {
     error: { t: "저장 실패", c: "text-rose-300" },
   };
   const s = map[state] || map.idle;
-  return <span className={"text-[11px] " + s.c}>{s.t}</span>;
+  return (
+    <span className="text-[11px] flex items-center gap-2">
+      <span className={s.c}>{s.t}</span>
+      {drive && !drive.ok && getDriveConfig().url && <span className="text-rose-300">드라이브 백업 실패</span>}
+    </span>
+  );
 }
 
 /* ================= Backup / restore (full page) ================= */
@@ -1323,10 +1423,25 @@ function Field({ label, children }) {
 }
 
 /* ================= Settings (API key) ================= */
-function SettingsPage({ onBack }) {
+function SettingsPage({ onBack, lessons, driveLast, onDriveBackup }) {
   const [key, setKey] = useState(getApiKey());
   const [model, setModel] = useState(getModel());
   const [saved, setSaved] = useState(false);
+  const [driveUrl, setDriveUrl] = useState(lsGet(DRIVE_URL_STORAGE));
+  const [driveKey, setDriveKey] = useState(lsGet(DRIVE_KEY_STORAGE));
+  const [driveBusy, setDriveBusy] = useState(false);
+  const [driveMsg, setDriveMsg] = useState("");
+  const saveDrive = async () => {
+    lsSet(DRIVE_URL_STORAGE, driveUrl.trim());
+    lsSet(DRIVE_KEY_STORAGE, driveKey.trim());
+    setDriveMsg("");
+    if (!driveUrl.trim() || !driveKey.trim()) { setDriveMsg("연동을 해제했습니다."); return; }
+    if (!lessons.length) { setDriveMsg("저장했습니다. 레슨 기록이 생기면 자동으로 백업됩니다."); return; }
+    setDriveBusy(true);
+    await onDriveBackup(lessons);
+    setDriveBusy(false);
+  };
+  const when = (iso) => new Date(iso).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const save = () => {
     try {
       if (key.trim()) localStorage.setItem(API_KEY_STORAGE, key.trim());
@@ -1369,6 +1484,42 @@ function SettingsPage({ onBack }) {
           콘솔에서 키 발급 <ExternalLink size={13} />
         </a>
         <p className="text-xs text-slate-400 pt-1">주의: 개인용 기기에서만 사용하세요. 키를 넣은 앱을 남과 공유하면 키가 노출될 수 있습니다.</p>
+      </div>
+      <div className={card + " p-6 space-y-4"}>
+        <div>
+          <div className="font-semibold text-slate-800 flex items-center gap-1.5"><CloudUpload size={17} /> 구글 드라이브 자동 백업</div>
+          <p className="text-sm text-slate-500 mt-1">
+            레슨을 저장할 때마다 내 구글 드라이브 '레슨로그' 폴더에 기록을 올립니다. PC의 주간 워드 정리가 이 백업을 사용합니다.
+          </p>
+        </div>
+        <div>
+          <div className="text-xs font-medium text-slate-500 mb-1">웹 앱 URL</div>
+          <input className={inp} value={driveUrl} onChange={e => setDriveUrl(e.target.value)}
+            placeholder="https://script.google.com/macros/s/.../exec" autoComplete="off" />
+        </div>
+        <div>
+          <div className="text-xs font-medium text-slate-500 mb-1">연동 키</div>
+          <input type="password" className={inp} value={driveKey} onChange={e => setDriveKey(e.target.value)} autoComplete="off" />
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <button onClick={saveDrive} disabled={driveBusy}
+            className="px-5 py-2.5 rounded-lg bg-slate-900 text-white font-medium text-sm flex items-center gap-1.5 disabled:opacity-50">
+            {driveBusy ? <Loader2 size={16} className="animate-spin" /> : <CloudUpload size={16} />}
+            {driveBusy ? "백업 중…" : "저장하고 지금 백업"}
+          </button>
+          {driveMsg
+            ? <span className="text-sm text-slate-600">{driveMsg}</span>
+            : driveLast && driveUrl && (
+              <span className={"text-sm " + (!driveLast.ok ? "text-rose-600" : driveLast.unconfirmed ? "text-amber-700" : "text-emerald-700")}>
+                {driveLast.ok
+                  ? `마지막 백업 ${when(driveLast.at)} · ${driveLast.count}개${driveLast.unconfirmed ? " (응답을 확인하지 못했어요 — 웹 앱 URL을 확인하세요)" : ""}`
+                  : `백업 실패 (${when(driveLast.at)}): ${driveLast.error}`}
+              </span>
+            )}
+        </div>
+        <p className="text-xs text-slate-400">
+          설정 방법은 PC의 '문서\레슨로그\구글드라이브 연동\설정 방법.txt'에 있습니다. 연동 링크로 앱을 열면 자동으로 입력됩니다.
+        </p>
       </div>
     </div>
   );
