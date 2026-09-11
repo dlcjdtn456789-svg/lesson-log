@@ -1,0 +1,9 @@
+{
+  "name": "lesson-log-weekly-docs",
+  "private": true,
+  "type": "module",
+  "description": "Weekly Word documents from lesson-log data: cumulative teaching curriculum + lesson log backup",
+  "dependencies": {
+    "docx": "^9.0.0"
+  }
+}
